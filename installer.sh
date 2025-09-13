@@ -1,241 +1,358 @@
 #!/bin/bash
 
-# Check if the script is run with sudo privileges
-if [ "$(id -u)" -ne 0 ]; then
-    echo "This script must be run as root. Use 'sudo ./installer.sh'"
-    exit 1
-fi
+# Enable strict error handling
+set -euo pipefail
+trap 'error_handler $? $LINENO' ERR
 
-# Set up variables for this script
+# Configuration
 SCRIPT_PERMISSIONS="755"
 SESSION_FILE_PERMISSIONS="644"
 STEAMOS_POLKIT_HELPERS_DIR="steamos-polkit-helpers"
 USR_BIN_DIR="/usr/bin"
 WAYLAND_SESSIONS_DIR="/usr/share/wayland-sessions"
 
-# Get the username
-USERNAME=$(logname 2>/dev/null || echo "$SUDO_USER" || echo "$USER")
+# Logging setup
+LOG_FILE="/var/log/steam-gamescope-installer.log"
+LOG_LEVEL="${LOG_LEVEL:-INFO}"  # Can be DEBUG, INFO, WARN, ERROR
 
-# Ensure the scripts have the correct permissions set
-#
-# 'gamescope-session'
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/gamescope-session
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# 'jupiter-biosupdate'
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/jupiter-biosupdate
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate
+# Function to log messages
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Log to file
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    
+    # Also display to console with colors
+    case "$level" in
+        ERROR)
+            echo -e "${RED}[ERROR]${NC} $message" >&2
+            ;;
+        WARN)
+            echo -e "${YELLOW}[WARN]${NC} $message"
+            ;;
+        INFO)
+            echo -e "${GREEN}[INFO]${NC} $message"
+            ;;
+        DEBUG)
+            if [ "$LOG_LEVEL" = "DEBUG" ]; then
+                echo "[DEBUG] $message"
+            fi
+            ;;
+    esac
+}
 
-# 'steamos-select-branch'
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/steamos-select-branch
+# Error handler for rollback
+error_handler() {
+    local exit_code=$1
+    local line_number=$2
+    log "ERROR" "Script failed with exit code $exit_code at line $line_number"
+    log "INFO" "Starting rollback..."
+    rollback
+    exit "$exit_code"
+}
 
-# 'steamos-session-select'
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/steamos-session-select
+# Rollback function
+rollback() {
+    log "INFO" "Rolling back changes..."
+    
+    # Track what was installed for rollback
+    if [ -f "/tmp/gamescope_install_tracker" ]; then
+        while IFS= read -r file; do
+            if [ -f "$file" ]; then
+                rm -f "$file"
+                log "INFO" "Removed: $file"
+            elif [ -d "$file" ]; then
+                # Only remove directory if it's empty and was created by us
+                if [ -z "$(ls -A "$file" 2>/dev/null)" ]; then
+                    rmdir "$file" 2>/dev/null || true
+                    log "INFO" "Removed empty directory: $file"
+                fi
+            fi
+        done < "/tmp/gamescope_install_tracker"
+        rm -f "/tmp/gamescope_install_tracker"
+    fi
+    
+    # Restore autologin if it was modified
+    if [ -f "/tmp/autologin_backup" ]; then
+        # shellcheck source=/dev/null
+        source /tmp/autologin_backup
+        if [ -n "${BACKUP_DM:-}" ] && [ -n "${USERNAME:-}" ]; then
+            if [ -f "$USR_BIN_DIR/steamos-autologin" ]; then
+                "$USR_BIN_DIR/steamos-autologin" disable "$USERNAME" 2>/dev/null || true
+            fi
+        fi
+        rm -f "/tmp/autologin_backup"
+    fi
+    
+    log "INFO" "Rollback completed"
+}
 
-# 'steamos-update'
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/steamos-update
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update
+# Function to track installed files
+track_installation() {
+    echo "$1" >> /tmp/gamescope_install_tracker
+}
 
-# 'steamos-set-timezone'
-chmod $SCRIPT_PERMISSIONS .$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone
+# Version checking function
+check_version() {
+    local command="$1"
+    local min_version="$2"
+    local current_version
+    
+    if ! command -v "$command" &> /dev/null; then
+        log "ERROR" "$command is not installed"
+        return 1
+    fi
+    
+    case "$command" in
+        gamescope)
+            current_version=$(gamescope --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+            ;;
+        steam)
+            # Steam version is harder to get reliably
+            if steam --version &>/dev/null; then
+                current_version=$(steam --version 2>&1 | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || echo "0.0.0.0")
+            else
+                log "WARN" "Could not determine Steam version, assuming it's compatible"
+                return 0
+            fi
+            ;;
+        *)
+            log "WARN" "Unknown command for version check: $command"
+            return 0
+            ;;
+    esac
+    
+    if [ -n "$current_version" ] && [ "$current_version" != "0.0.0" ]; then
+        log "INFO" "$command version: $current_version (minimum required: $min_version)"
+        # Simple version comparison (may need enhancement for complex versions)
+        if [ "$(printf '%s\n' "$min_version" "$current_version" | sort -V | head -n1)" != "$min_version" ]; then
+            log "ERROR" "$command version $current_version is below minimum required version $min_version"
+            return 1
+        fi
+    fi
+    return 0
+}
 
-# Ensure the session file has the correct permissions set
-#
-# 'steam.desktop'
-chmod $SESSION_FILE_PERMISSIONS .$WAYLAND_SESSIONS_DIR/steam.desktop
+# Input validation function
+validate_username() {
+    local username="$1"
+    
+    # Check if username is empty
+    if [ -z "$username" ]; then
+        log "ERROR" "Username cannot be empty"
+        return 1
+    fi
+    
+    # Check if username contains only valid characters (alphanumeric, underscore, hyphen)
+    if ! echo "$username" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+        log "ERROR" "Username contains invalid characters. Only alphanumeric, underscore, and hyphen are allowed."
+        return 1
+    fi
+    
+    # Check if username is too long (Linux typically limits to 32 characters)
+    if [ ${#username} -gt 32 ]; then
+        log "ERROR" "Username is too long (maximum 32 characters)"
+        return 1
+    fi
+    
+    # Check if user exists
+    if ! id "$username" &>/dev/null; then
+        log "ERROR" "User '$username' does not exist"
+        return 1
+    fi
+    
+    log "DEBUG" "Username '$username' validated successfully"
+    return 0
+}
 
-# Create a 'steamos-polkit-helpers' folder under '/usr/bin'
-sudo mkdir -p $USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR
+# Function to safely copy and track files
+safe_copy() {
+    local source="$1"
+    local dest="$2"
+    local perms="${3:-755}"
+    
+    if [ ! -f "$source" ]; then
+        log "ERROR" "Source file does not exist: $source"
+        return 1
+    fi
+    
+    # Create parent directory if needed
+    local parent_dir
+    parent_dir=$(dirname "$dest")
+    if [ ! -d "$parent_dir" ]; then
+        mkdir -p "$parent_dir"
+        track_installation "$parent_dir"
+    fi
+    
+    # Copy file
+    cp "$source" "$dest"
+    chmod "$perms" "$dest"
+    track_installation "$dest"
+    log "DEBUG" "Installed: $dest (permissions: $perms)"
+    
+    return 0
+}
 
-# Copy the following scripts to the /usr/bin folder
-#
-# 'gamescope-session'
-sudo cp .$USR_BIN_DIR/gamescope-session \
-    $USR_BIN_DIR/gamescope-session
+# Main script starts here
 
-# 'jupiter-biosupdate'
-sudo cp .$USR_BIN_DIR/jupiter-biosupdate \
-    $USR_BIN_DIR/jupiter-biosupdate
-sudo cp .$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate \
-    $USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate
+# Check if the script is run with root privileges
+if [ "$EUID" -ne 0 ]; then
+    echo "This script must be run as root. Use 'sudo ./installer.sh'"
+    exit 1
+fi
 
-# 'steamos-select-branch'
-sudo cp .$USR_BIN_DIR/steamos-select-branch \
-    $USR_BIN_DIR/steamos-select-branch
+# Initialize installation tracker
+> /tmp/gamescope_install_tracker
 
-# 'steamos-session-select'
-sudo cp .$USR_BIN_DIR/steamos-session-select \
-    $USR_BIN_DIR/steamos-session-select
+# Start logging
+log "INFO" "Starting Steam Gamescope installation - $(date)"
+log "INFO" "Log file: $LOG_FILE"
 
-# 'steamos-update'
-sudo cp .$USR_BIN_DIR/steamos-update \
-    $USR_BIN_DIR/steamos-update
-sudo cp .$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update \
-    $USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update
+# Get the username - first try to get the original user who ran sudo
+USERNAME=$(logname 2>/dev/null || echo "${SUDO_USER:-$USER}")
 
-# 'steamos-set-timezone'
-sudo cp .$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone \
-    $USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone
+# If still root, ask for username
+if [ "$USERNAME" = "root" ] || [ -z "$USERNAME" ]; then
+    read -rp "Please enter the username of the primary user: " USERNAME
+fi
 
-# Copy the following scripts to the /usr/share folder
-#
-# 'steam.desktop'
-sudo cp .$WAYLAND_SESSIONS_DIR/steam.desktop \
-    $WAYLAND_SESSIONS_DIR/steam.desktop
+# Validate username
+if ! validate_username "$USERNAME"; then
+    log "ERROR" "Invalid username provided. Exiting..."
+    exit 1
+fi
 
-# Copy the steamos-autologin script to /usr/bin if it exists
-if [ -f ./steamos-autologin ]; then
-    echo "Installing steamos-autologin utility..."
-    sudo cp ./steamos-autologin $USR_BIN_DIR/steamos-autologin
-    sudo chmod 755 $USR_BIN_DIR/steamos-autologin
+log "INFO" "Installing for user: $USERNAME"
+
+# Check required software versions
+log "INFO" "Checking required software versions..."
+
+# Check gamescope (minimum version 3.11.0 for basic functionality)
+if ! check_version "gamescope" "3.11.0"; then
+    log "WARN" "Gamescope version check failed"
+    read -rp "Continue anyway? (y/n): " response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        log "INFO" "Installation cancelled by user"
+        exit 1
+    fi
+fi
+
+# Check steam
+if ! command -v steam &> /dev/null; then
+    log "WARN" "Steam is not installed. It will be required to run the gamescope session."
+    read -rp "Continue anyway? (y/n): " response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        log "INFO" "Installation cancelled by user"
+        exit 1
+    fi
+fi
+
+log "INFO" "Creating directories..."
+
+# Create steamos-polkit-helpers directory
+mkdir -p "$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR"
+track_installation "$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR"
+
+# Ensure wayland-sessions directory exists
+mkdir -p "$WAYLAND_SESSIONS_DIR"
+
+log "INFO" "Setting permissions on source files..."
+
+# Ensure the scripts have the correct permissions set before copying
+[ -f ".$USR_BIN_DIR/gamescope-session" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/gamescope-session"
+[ -f ".$USR_BIN_DIR/jupiter-biosupdate" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/jupiter-biosupdate"
+[ -f ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate"
+[ -f ".$USR_BIN_DIR/steamos-select-branch" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/steamos-select-branch"
+[ -f ".$USR_BIN_DIR/steamos-session-select" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/steamos-session-select"
+[ -f ".$USR_BIN_DIR/steamos-update" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/steamos-update"
+[ -f ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update"
+[ -f ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone" ] && chmod "$SCRIPT_PERMISSIONS" ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone"
+[ -f ".$WAYLAND_SESSIONS_DIR/steam.desktop" ] && chmod "$SESSION_FILE_PERMISSIONS" ".$WAYLAND_SESSIONS_DIR/steam.desktop"
+
+log "INFO" "Installing scripts..."
+
+# Install scripts with error checking
+safe_copy ".$USR_BIN_DIR/gamescope-session" "$USR_BIN_DIR/gamescope-session" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/jupiter-biosupdate" "$USR_BIN_DIR/jupiter-biosupdate" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate" "$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/jupiter-biosupdate" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/steamos-select-branch" "$USR_BIN_DIR/steamos-select-branch" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/steamos-session-select" "$USR_BIN_DIR/steamos-session-select" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/steamos-update" "$USR_BIN_DIR/steamos-update" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update" "$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-update" "$SCRIPT_PERMISSIONS"
+safe_copy ".$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone" "$USR_BIN_DIR/$STEAMOS_POLKIT_HELPERS_DIR/steamos-set-timezone" "$SCRIPT_PERMISSIONS"
+safe_copy ".$WAYLAND_SESSIONS_DIR/steam.desktop" "$WAYLAND_SESSIONS_DIR/steam.desktop" "$SESSION_FILE_PERMISSIONS"
+
+# Install steamos-autologin if it exists
+if [ -f "./steamos-autologin" ]; then
+    log "INFO" "Installing autologin helper..."
+    safe_copy "./steamos-autologin" "$USR_BIN_DIR/steamos-autologin" "$SCRIPT_PERMISSIONS"
 fi
 
 # Ask user about autologin configuration
 echo
-read -p "Do you want to enable autologin to the Steam gamescope session? (y/N) " -r
+read -rp "Do you want to enable autologin to the Steam gamescope session? (y/N) " REPLY
 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    # Save current autologin state for potential rollback
+    {
+        echo "USERNAME=$USERNAME"
+        if command -v lightdm &> /dev/null; then
+            echo "BACKUP_DM=lightdm"
+        elif command -v sddm &> /dev/null; then
+            echo "BACKUP_DM=sddm"
+        elif command -v gdm &> /dev/null || command -v gdm3 &> /dev/null; then
+            echo "BACKUP_DM=gdm"
+        fi
+    } > /tmp/autologin_backup
+    
     # Use the new steamos-autologin script if available
-    if [ -f $USR_BIN_DIR/steamos-autologin ]; then
-        echo
-        echo "Enabling autologin for user: $USERNAME"
-        sudo $USR_BIN_DIR/steamos-autologin enable "$USERNAME"
-        
-        echo
-        echo "Installation complete with autologin enabled!"
-        echo "You can now:"
-        echo "1. Reboot your system to automatically start in gaming mode"
-        echo "   OR"
-        echo "2. Log out and select 'Steam (gamescope)' from your display manager"
-        echo
-        read -p "Would you like to reboot now? (y/n): " -r
-        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            echo "Rebooting..."
-            sleep 2
-            reboot
+    if [ -f "$USR_BIN_DIR/steamos-autologin" ]; then
+        log "INFO" "Enabling autologin for user: $USERNAME"
+        if "$USR_BIN_DIR/steamos-autologin" enable "$USERNAME"; then
+            log "INFO" "Autologin configured successfully"
+        else
+            log "WARN" "Failed to configure autologin automatically"
+            log "INFO" "Please configure autologin manually for your display manager"
         fi
     else
-        # Fallback to manual configuration if script is not available
-        echo
-        echo "Which display manager are you using?"
-        echo "1) LightDM"
-        echo "2) SDDM"
-        echo "3) GDM/GDM3"
-        echo "4) I don't know / Skip autologin"
-        echo
-        read -r -p "Enter your choice (1-4): " DM_CHOICE
-        
-        case "$DM_CHOICE" in
-            1)
-                echo "Configuring LightDM autologin for user: $USERNAME"
-                
-                # Backup and configure LightDM
-                if [ -f /etc/lightdm/lightdm.conf ]; then
-                    cp /etc/lightdm/lightdm.conf "/etc/lightdm/lightdm.conf.backup.$(date +%Y%m%d_%H%M%S)"
-                fi
-                
-                mkdir -p /etc/lightdm/lightdm.conf.d/
-                cat > /etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf <<EOF
-[Seat:*]
-autologin-user=$USERNAME
-autologin-session=steam
-autologin-user-timeout=0
-EOF
-                
-                # Add user to autologin group if it exists
-                if getent group autologin > /dev/null 2>&1; then
-                    usermod -a -G autologin "$USERNAME"
-                fi
-                
-                echo "LightDM autologin configured!"
-                ;;
-                
-            2)
-                echo "Configuring SDDM autologin for user: $USERNAME"
-                
-                # Backup and configure SDDM
-                mkdir -p /etc/sddm.conf.d/
-                cat > /etc/sddm.conf.d/autologin.conf <<EOF
-[Autologin]
-User=$USERNAME
-Session=steam
-Relogin=false
-
-[General]
-DisplayServer=wayland
-EOF
-                
-                echo "SDDM autologin configured!"
-                ;;
-                
-            3)
-                echo "Configuring GDM autologin for user: $USERNAME"
-                
-                # Find GDM config path
-                if [ -f /etc/gdm3/custom.conf ]; then
-                    GDM_CONF="/etc/gdm3/custom.conf"
-                elif [ -f /etc/gdm/custom.conf ]; then
-                    GDM_CONF="/etc/gdm/custom.conf"
-                else
-                    echo "Error: Could not find GDM configuration file"
-                    echo "Skipping autologin configuration"
-                    GDM_CONF=""
-                fi
-                
-                if [ -n "$GDM_CONF" ]; then
-                    # Backup existing config
-                    cp "$GDM_CONF" "${GDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-                    
-                    # Update or add autologin settings
-                    if grep -q "^\[daemon\]" "$GDM_CONF"; then
-                        # Section exists, update it
-                        sed -i '/^\[daemon\]/,/^\[/ {
-                            s/^AutomaticLoginEnable=.*/AutomaticLoginEnable=true/
-                            s/^AutomaticLogin=.*/AutomaticLogin='"$USERNAME"'/
-                        }' "$GDM_CONF"
-                        
-                        # Add lines if they don't exist
-                        if ! grep -q "^AutomaticLoginEnable=" "$GDM_CONF"; then
-                            sed -i "/^\[daemon\]/a AutomaticLoginEnable=true" "$GDM_CONF"
-                        fi
-                        if ! grep -q "^AutomaticLogin=" "$GDM_CONF"; then
-                            sed -i "/^\[daemon\]/a AutomaticLogin=$USERNAME" "$GDM_CONF"
-                        fi
-                    else
-                        # Section doesn't exist, add it
-                        {
-                            echo ""
-                            echo "[daemon]"
-                            echo "AutomaticLoginEnable=true"
-                            echo "AutomaticLogin=$USERNAME"
-                        } >> "$GDM_CONF"
-                    fi
-                    
-                    echo "GDM autologin configured!"
-                fi
-                ;;
-                
-            *)
-                echo "Skipping autologin configuration."
-                ;;
-        esac
-        
-        if [[ "$DM_CHOICE" =~ ^[1-3]$ ]]; then
-            echo
-            echo "Installation complete with autologin enabled!"
-            echo "You can now:"
-            echo "1. Reboot your system to automatically start in gaming mode"
-            echo "   OR"
-            echo "2. Log out and select 'Steam (gamescope)' from your display manager"
-            echo
-            read -p "Would you like to reboot now? (y/n): " -r
-            if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-                echo "Rebooting..."
-                sleep 2
-                reboot
-            fi
-        fi
+        log "WARN" "steamos-autologin script not found. Please configure autologin manually."
     fi
-else
+fi
+
+# Clean up installation tracker on success
+rm -f /tmp/gamescope_install_tracker
+rm -f /tmp/autologin_backup
+
+log "INFO" "Installation complete!"
+echo
+echo "Installation complete!"
+echo
+echo "To use Steam with Gamescope:"
+echo "  1. Log out of your current session"
+echo "  2. At the login screen, select 'Steam' as your session type"
+echo "  3. Log in with your user account"
+echo
+echo "Note: You can switch back to your regular desktop session at any time"
+echo "      by selecting it from the session menu at the login screen."
+echo
+echo "Installation log saved to: $LOG_FILE"
+
+# Ask about reboot if autologin was configured
+if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     echo
-    echo "Installation complete!"
-    echo "You can now log out and select 'Steam (gamescope)' from your display manager."
+    read -rp "Would you like to reboot now? (y/n): " REBOOT_REPLY
+    if [[ "$REBOOT_REPLY" =~ ^[Yy]$ ]]; then
+        log "INFO" "Rebooting system..."
+        sleep 2
+        reboot
+    fi
 fi

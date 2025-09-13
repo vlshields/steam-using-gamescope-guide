@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="$(basename "$0")"
+DRY_RUN=false
 
 show_help() {
     cat << EOF
@@ -19,6 +20,7 @@ Commands:
 Options:
     -d, --dm DM       Specify display manager (lightdm, sddm, gdm)
                       If not specified, attempts auto-detection
+    -n, --dry-run     Show what would be done without making changes
     -h, --help        Show this help message
     -v, --version     Show version information
     
@@ -67,9 +69,25 @@ detect_display_manager() {
 backup_config() {
     local config_file="$1"
     if [ -f "$config_file" ]; then
-        local backup_file="${config_file}.backup.$(date +%Y%m%d_%H%M%S)"
-        cp "$config_file" "$backup_file"
-        echo "Backed up $config_file to $backup_file"
+        if [ "$DRY_RUN" = true ]; then
+            echo "[DRY-RUN] Would backup $config_file"
+        else
+            local backup_file="${config_file}.backup.$(date +%Y%m%d_%H%M%S)"
+            cp "$config_file" "$backup_file"
+            echo "Backed up $config_file to $backup_file"
+        fi
+    fi
+}
+
+write_config() {
+    local config_file="$1"
+    local content="$2"
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY-RUN] Would write to $config_file:"
+        echo "$content" | sed 's/^/    /'
+    else
+        echo "$content" > "$config_file"
     fi
 }
 
@@ -82,17 +100,26 @@ enable_lightdm_autologin() {
         backup_config /etc/lightdm/lightdm.conf
     fi
     
-    mkdir -p /etc/lightdm/lightdm.conf.d/
-    cat > /etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf <<EOF
-[Seat:*]
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY-RUN] Would create directory /etc/lightdm/lightdm.conf.d/"
+    else
+        mkdir -p /etc/lightdm/lightdm.conf.d/
+    fi
+    
+    local config_content="[Seat:*]
 autologin-user=$username
 autologin-session=steam
-autologin-user-timeout=0
-EOF
+autologin-user-timeout=0"
+    
+    write_config "/etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf" "$config_content"
     
     if getent group autologin > /dev/null 2>&1; then
-        usermod -a -G autologin "$username" 2>/dev/null || true
-        echo "Added $username to autologin group"
+        if [ "$DRY_RUN" = true ]; then
+            echo "[DRY-RUN] Would add $username to autologin group"
+        else
+            usermod -a -G autologin "$username" 2>/dev/null || true
+            echo "Added $username to autologin group"
+        fi
     fi
     
     echo "LightDM autologin enabled successfully!"
@@ -104,14 +131,22 @@ disable_lightdm_autologin() {
     echo "Disabling LightDM autologin..."
     
     if [ -f /etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf ]; then
-        rm /etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf
-        echo "Removed LightDM autologin configuration"
+        if [ "$DRY_RUN" = true ]; then
+            echo "[DRY-RUN] Would remove /etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf"
+        else
+            rm /etc/lightdm/lightdm.conf.d/50-gamescope-autologin.conf
+            echo "Removed LightDM autologin configuration"
+        fi
     fi
     
     if [ -n "$username" ] && getent group autologin > /dev/null 2>&1; then
         if ! find /etc/lightdm/lightdm.conf.d/ -name "*autologin*" 2>/dev/null | grep -q .; then
-            gpasswd -d "$username" autologin 2>/dev/null || true
-            echo "Removed $username from autologin group"
+            if [ "$DRY_RUN" = true ]; then
+                echo "[DRY-RUN] Would remove $username from autologin group"
+            else
+                gpasswd -d "$username" autologin 2>/dev/null || true
+                echo "Removed $username from autologin group"
+            fi
         fi
     fi
     
@@ -123,16 +158,21 @@ enable_sddm_autologin() {
     
     echo "Configuring SDDM autologin for user: $username"
     
-    mkdir -p /etc/sddm.conf.d/
-    cat > /etc/sddm.conf.d/autologin.conf <<EOF
-[Autologin]
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY-RUN] Would create directory /etc/sddm.conf.d/"
+    else
+        mkdir -p /etc/sddm.conf.d/
+    fi
+    
+    local config_content="[Autologin]
 User=$username
 Session=steam
 Relogin=false
 
 [General]
-DisplayServer=wayland
-EOF
+DisplayServer=wayland"
+    
+    write_config "/etc/sddm.conf.d/autologin.conf" "$config_content"
     
     echo "SDDM autologin enabled successfully!"
 }
@@ -141,8 +181,12 @@ disable_sddm_autologin() {
     echo "Disabling SDDM autologin..."
     
     if [ -f /etc/sddm.conf.d/autologin.conf ]; then
-        rm /etc/sddm.conf.d/autologin.conf
-        echo "Removed SDDM autologin configuration"
+        if [ "$DRY_RUN" = true ]; then
+            echo "[DRY-RUN] Would remove /etc/sddm.conf.d/autologin.conf"
+        else
+            rm /etc/sddm.conf.d/autologin.conf
+            echo "Removed SDDM autologin configuration"
+        fi
     fi
     
     echo "SDDM autologin disabled successfully!"
@@ -165,25 +209,36 @@ enable_gdm_autologin() {
     
     backup_config "$gdm_conf"
     
-    if grep -q "^\[daemon\]" "$gdm_conf"; then
-        sed -i '/^\[daemon\]/,/^\[/ {
-            s/^AutomaticLoginEnable=.*/AutomaticLoginEnable=true/
-            s/^AutomaticLogin=.*/AutomaticLogin='"$username"'/
-        }' "$gdm_conf"
-        
-        if ! grep -q "^AutomaticLoginEnable=" "$gdm_conf"; then
-            sed -i "/^\[daemon\]/a AutomaticLoginEnable=true" "$gdm_conf"
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY-RUN] Would modify $gdm_conf to enable autologin for $username"
+        if grep -q "^\[daemon\]" "$gdm_conf"; then
+            echo "[DRY-RUN] Would update existing [daemon] section"
+        else
+            echo "[DRY-RUN] Would add new [daemon] section"
         fi
-        if ! grep -q "^AutomaticLogin=" "$gdm_conf"; then
-            sed -i "/^\[daemon\]/a AutomaticLogin=$username" "$gdm_conf"
-        fi
+        echo "[DRY-RUN] Would set AutomaticLoginEnable=true"
+        echo "[DRY-RUN] Would set AutomaticLogin=$username"
     else
-        {
-            echo ""
-            echo "[daemon]"
-            echo "AutomaticLoginEnable=true"
-            echo "AutomaticLogin=$username"
-        } >> "$gdm_conf"
+        if grep -q "^\[daemon\]" "$gdm_conf"; then
+            sed -i '/^\[daemon\]/,/^\[/ {
+                s/^AutomaticLoginEnable=.*/AutomaticLoginEnable=true/
+                s/^AutomaticLogin=.*/AutomaticLogin='"$username"'/
+            }' "$gdm_conf"
+            
+            if ! grep -q "^AutomaticLoginEnable=" "$gdm_conf"; then
+                sed -i "/^\[daemon\]/a AutomaticLoginEnable=true" "$gdm_conf"
+            fi
+            if ! grep -q "^AutomaticLogin=" "$gdm_conf"; then
+                sed -i "/^\[daemon\]/a AutomaticLogin=$username" "$gdm_conf"
+            fi
+        else
+            {
+                echo ""
+                echo "[daemon]"
+                echo "AutomaticLoginEnable=true"
+                echo "AutomaticLogin=$username"
+            } >> "$gdm_conf"
+        fi
     fi
     
     echo "GDM autologin enabled successfully!"
@@ -205,9 +260,15 @@ disable_gdm_autologin() {
     
     if [ -f "$gdm_conf" ] && grep -q "^AutomaticLoginEnable=true" "$gdm_conf"; then
         backup_config "$gdm_conf"
-        sed -i 's/^AutomaticLoginEnable=true/AutomaticLoginEnable=false/' "$gdm_conf"
-        sed -i 's/^AutomaticLogin=.*/AutomaticLogin=/' "$gdm_conf"
-        echo "Disabled GDM autologin"
+        if [ "$DRY_RUN" = true ]; then
+            echo "[DRY-RUN] Would modify $gdm_conf to disable autologin"
+            echo "[DRY-RUN] Would set AutomaticLoginEnable=false"
+            echo "[DRY-RUN] Would clear AutomaticLogin"
+        else
+            sed -i 's/^AutomaticLoginEnable=true/AutomaticLoginEnable=false/' "$gdm_conf"
+            sed -i 's/^AutomaticLogin=.*/AutomaticLogin=/' "$gdm_conf"
+            echo "Disabled GDM autologin"
+        fi
     fi
     
     echo "GDM autologin disabled successfully!"
@@ -290,6 +351,10 @@ main() {
                     exit 1
                 fi
                 ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
             -h|--help)
                 show_help
                 exit 0
@@ -317,7 +382,11 @@ main() {
         exit 0
     fi
     
-    check_root
+    if [ "$DRY_RUN" = false ]; then
+        check_root
+    else
+        echo "[DRY-RUN MODE] Running without root privileges"
+    fi
     
     if [ "$command" == "enable" ] && [ -z "$username" ]; then
         echo "Error: Username is required for enable command"

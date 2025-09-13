@@ -15,5 +15,5 @@ else
 fi
 
 gamescope \
-    $MANGOAPP_FLAG \
+    "$MANGOAPP_FLAG" \
     -e -- steam -steamdeck -steamos3
